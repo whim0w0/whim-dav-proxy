@@ -1,0 +1,29 @@
+# whim-dav-proxy configuration file
+log:
+  level: info
+  format: console
+
+backends:
+  # backend name, supports multiple
+  - name: "expmple-web-dav"
+    listen:
+      # listen port
+      port: 411
+    webdav_host:
+      # upstream WebDAV server address
+      url: "http://example.com" # address
+      # optional credentials
+      username: "user"
+      password: "pass"
+    encryption:
+      # enable encryption
+      enable: true
+      # encryption password
+      password: "123456"
+      # optional algorithms: aesctr / chacha20 (stream ciphers)
+      #                      aesgcm / chacha20poly1305 / aesgcmsiv (block AEAD, supports random-access Range)
+      enc_type: "aesctr"
+      # enable filename encryption
+      enc_name: false
+      # filename encryption suffix
+      enc_suffix: ".enc"
