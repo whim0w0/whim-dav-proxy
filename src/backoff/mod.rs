@@ -112,11 +112,25 @@ where
     }
 }
 
-pub fn build_http_client(insecure: bool) -> Result<reqwest::Client, reqwest::Error> {
+/// 构建共享的上游 HTTP 客户端。
+///
+/// # 超时策略（重要）
+/// 这里**只**设置连接超时，**绝不**设置 reqwest 的 client 级总超时
+/// (`ClientBuilder::timeout`)。reqwest 的总超时是「整个请求生命周期」的硬性截止
+/// 时间：从开始连接 → 发送请求体 → 直到响应体读取结束。大文件 PUT/GET 的传输耗时
+/// 很容易超过任意固定值，一旦触发就会中断传输并报
+/// `error sending request for url (...)`（上游往往已收到部分数据，导致文件损坏）。
+///
+/// 传输阶段的「卡死/停滞」检测改为在流式读写处按**空闲时间**（idle）判断，
+/// 即每成功读到一块数据就重新计时，见 `service::cipher_engine` 与 `service::proxy`。
+pub fn build_http_client(
+    insecure: bool,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
     let mut b: reqwest::ClientBuilder = reqwest::Client::builder()
         .pool_max_idle_per_host(100)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(30));
+        .connect_timeout(connect_timeout);
 
     if insecure {
         b = b.danger_accept_invalid_certs(true);

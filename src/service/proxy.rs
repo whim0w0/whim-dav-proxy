@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::backoff::{self, CircuitBreaker};
 use crate::config::EncryptionConfig;
 use crate::crypto::{CYPTO_META_SIZE, CryptoMeta, EncType};
-use crate::errors::ProxyError;
+use crate::errors::{ProxyError, reqwest_error};
 use crate::service::cipher_engine::{CipherBox, CipherEngine};
 
 pub struct ProxyEngine {
@@ -17,17 +17,29 @@ pub struct ProxyEngine {
     pub circuit_breaker: CircuitBreaker,
 
     pub max_retries: usize,
+
+    /// 仅用于**非流式**请求（体积已知且小、且已经完整缓冲在内存中）的总超时。
+    /// 例如 PROPFIND / DELETE / HEAD 探测 / 明文直通的 PUT。
+    /// 必须**不**作用于流式上传或下载，否则大文件传输会被硬性截断。
+    pub request_timeout: Option<Duration>,
+
+    /// 流式上传/下载的**空闲**超时：每成功传输一块数据就重新计时。
+    /// `None` 表示不限制。用于检测停滞的连接，而不是限制传输总时长。
+    pub idle_timeout: Option<Duration>,
+
+    /// 流式传输的缓冲字节量（由配置 `stream.buffer_kb` 转换而来）。
+    /// 用作上传加密通道的背压容量，避免客户端发送快于上游写入时无限堆积内存。
+    pub buffer_bytes: usize,
 }
 
 impl ProxyEngine {
     pub fn new(cfg: &crate::config::BackendConfig) -> Result<Self, ProxyError> {
         let insecure: bool = cfg.webdav_host.insecure_skip_verify;
+        let stream: &crate::config::StreamConfig = &cfg.stream;
 
-        let client: reqwest::Client = backoff::build_http_client(insecure)
+        let connect: Duration = Duration::from_secs(stream.connect_timeout_secs.max(1));
+        let client: reqwest::Client = backoff::build_http_client(insecure, connect)
             .map_err(|e: reqwest::Error| ProxyError::internal(format!("http client: {}", e)))?;
-
-        let default_stream: crate::config::StreamConfig = crate::config::StreamConfig::default();
-        let stream: &crate::config::StreamConfig = &default_stream;
 
         let cb: CircuitBreaker = CircuitBreaker::new(
             stream.circuit_breaker_threshold,
@@ -38,7 +50,26 @@ impl ProxyEngine {
             client,
             circuit_breaker: cb,
             max_retries: stream.retry_max_attempts,
+            request_timeout: (stream.request_timeout_secs > 0)
+                .then(|| Duration::from_secs(stream.request_timeout_secs)),
+            idle_timeout: (stream.idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(stream.idle_timeout_secs)),
+            buffer_bytes: stream.buffer_kb.max(64) * 1024,
         })
+    }
+
+    /// 上传加密通道的背压容量（槽位数）。
+    fn upload_channel_capacity(&self) -> usize {
+        const CHUNK: usize = 64 * 1024;
+        (self.buffer_bytes / CHUNK).max(1)
+    }
+
+    /// 给**非流式**请求附加总超时。
+    fn timed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.request_timeout {
+            Some(t) => rb.timeout(t),
+            None => rb,
+        }
     }
 
     pub fn upstream_url(cfg: &crate::config::BackendConfig, path: &str) -> String {
@@ -66,10 +97,11 @@ impl ProxyEngine {
         let m: Method = method.clone();
 
         let response: reqwest::Response = backoff::retry(self.max_retries, || {
-            let req: reqwest::RequestBuilder = self
-                .client
-                .request(m.clone(), &target)
-                .headers(req_headers.clone());
+            let req: reqwest::RequestBuilder = self.timed(
+                self.client
+                    .request(m.clone(), &target)
+                    .headers(req_headers.clone()),
+            );
             let b: Bytes = body.clone();
 
             async move {
@@ -83,7 +115,7 @@ impl ProxyEngine {
         .await
         .map_err(|e: reqwest::Error| {
             self.circuit_breaker.record_failure();
-            ProxyError::proxy(format!("proxy request failed: {}", e))
+            reqwest_error("proxy request failed", e)
         })?;
 
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
@@ -100,7 +132,7 @@ impl ProxyEngine {
         let resp_body: Bytes = response
             .bytes()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("read response: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("read response", e))?;
 
         let resp_headers: HeaderMap = strip_content_length(resp_headers);
         Ok((status, resp_headers, resp_body))
@@ -126,12 +158,10 @@ impl ProxyEngine {
         let hdrs: HeaderMap = convert_headers(&h);
 
         let response: reqwest::Response = self
-            .client
-            .get(&target)
-            .headers(hdrs)
+            .timed(self.client.get(&target).headers(hdrs))
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("header probe: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("header probe", e))?;
 
         let cipher_len: Option<u64> = response
             .headers()
@@ -144,7 +174,7 @@ impl ProxyEngine {
         let data: Bytes = response
             .bytes()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("header probe read: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("header probe read", e))?;
 
         if data.len() >= 64 {
             if let Some(meta) = CryptoMeta::parse_header(&data[..64]) {
@@ -168,7 +198,7 @@ impl ProxyEngine {
             .headers(req_headers)
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("download: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("download", e))?;
 
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -179,8 +209,8 @@ impl ProxyEngine {
         }
         let resp_headers: HeaderMap = strip_content_length(response.headers().clone());
 
+        let mut stream = crate::service::cipher_engine::guard_idle(response, self.idle_timeout);
         tokio::spawn(async move {
-            let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(data) => {
@@ -189,7 +219,7 @@ impl ProxyEngine {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(ProxyError::proxy(format!("stream read: {}", e))));
+                        let _ = tx.send(Err(e));
                         break;
                     }
                 }
@@ -277,9 +307,9 @@ impl ProxyEngine {
         let req_headers: HeaderMap = convert_headers(headers);
 
         let (body_tx, body_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<Bytes, ProxyError>>();
+            tokio::sync::mpsc::channel::<Result<Bytes, ProxyError>>(self.upload_channel_capacity());
 
-        let engine: &CipherEngine = &CipherEngine::for_type(enc_type);
+        let engine: CipherEngine = CipherEngine::for_type(enc_type);
         engine.spawn_encrypt(body_stream, cipher, meta_header, body_tx);
 
         let req_body_stream = futures_util::stream::unfold(body_rx, |mut rx| async move {
@@ -296,7 +326,7 @@ impl ProxyEngine {
             .await
             .map_err(|e: reqwest::Error| {
                 self.circuit_breaker.record_failure();
-                ProxyError::proxy(format!("upload: {}", e))
+                reqwest_error("upload", e)
             })?;
 
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
@@ -319,7 +349,7 @@ impl ProxyEngine {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(ProxyError::proxy(format!("upload response: {}", e))));
+                        let _ = tx.send(Err(reqwest_error("upload response", e)));
                         break;
                     }
                 }
@@ -367,7 +397,7 @@ impl ProxyEngine {
             .headers(req_headers)
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("download: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("download", e))?;
 
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -387,7 +417,15 @@ impl ProxyEngine {
 
         cipher.skip_header();
 
-        engine.spawn_decrypt(response, cipher, CYPTO_META_SIZE, 0, None, tx);
+        engine.spawn_decrypt(
+            response,
+            cipher,
+            CYPTO_META_SIZE,
+            0,
+            None,
+            self.idle_timeout,
+            tx,
+        );
 
         Ok((status, resp_headers))
     }
@@ -484,7 +522,7 @@ impl ProxyEngine {
             .headers(convert_headers(&h))
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("range download: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("range download", e))?;
 
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -498,7 +536,15 @@ impl ProxyEngine {
 
         match status {
             StatusCode::PARTIAL_CONTENT => {
-                engine.spawn_range_decrypt(response, cipher, start, skip_plain, Some(want), tx);
+                engine.spawn_range_decrypt(
+                    response,
+                    cipher,
+                    start,
+                    skip_plain,
+                    Some(want),
+                    self.idle_timeout,
+                    tx,
+                );
             }
 
             s if s.is_success() => {
@@ -510,6 +556,7 @@ impl ProxyEngine {
                     CYPTO_META_SIZE,
                     start as usize,
                     Some(want),
+                    self.idle_timeout,
                     tx,
                 );
             }
@@ -547,12 +594,10 @@ impl ProxyEngine {
             HeaderValue::from_static("identity"),
         );
         let response: reqwest::Response = self
-            .client
-            .head(target_url)
-            .headers(convert_headers(&h))
+            .timed(self.client.head(target_url).headers(convert_headers(&h)))
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("head probe: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("head probe", e))?;
         if response.status().is_success() {
             let len: Option<u64> = response
                 .headers()
@@ -574,12 +619,10 @@ impl ProxyEngine {
         let mut hdrs: HeaderMap = convert_headers(&h2);
         hdrs.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
         let resp2: reqwest::Response = self
-            .client
-            .get(target_url)
-            .headers(hdrs)
+            .timed(self.client.get(target_url).headers(hdrs))
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("length probe: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("length probe", e))?;
 
         let cr: Option<u64> = resp2
             .headers()
@@ -602,12 +645,10 @@ impl ProxyEngine {
         strip_conditional_headers(&mut h);
         h.remove("range");
         let response: reqwest::Response = self
-            .client
-            .head(target_url)
-            .headers(convert_headers(&h))
+            .timed(self.client.head(target_url).headers(convert_headers(&h)))
             .send()
             .await
-            .map_err(|e: reqwest::Error| ProxyError::proxy(format!("head: {}", e)))?;
+            .map_err(|e: reqwest::Error| reqwest_error("head", e))?;
         let status: StatusCode = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         Ok((status, response.headers().clone()))

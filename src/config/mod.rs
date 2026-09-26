@@ -38,6 +38,8 @@ pub struct BackendConfig {
     pub webdav_host: WebdavHostConfig,
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
+    #[serde(default)]
+    pub stream: StreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,17 @@ fn default_enc_type() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
+    /// 建立 TCP/TLS 连接的超时（秒），仅作用于连接阶段。
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// 非流式请求（体积已知且较小的请求，如 PROPFIND/DELETE/HEAD 探测）的总超时（秒）。
+    /// `0` 表示不限制。**不会**作用于流式上传/下载。
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
+    /// 流式读写（上传加密 / 下载解密）的**空闲**超时（秒）：每成功收到一块数据重新计时。
+    /// `0` 表示不限制。用于检测停滞的连接，而不是限制大文件的总传输时长。
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
     #[serde(default = "default_buffer_kb")]
     pub buffer_kb: usize,
     #[serde(default = "default_cb_threshold")]
@@ -87,6 +100,15 @@ pub struct StreamConfig {
     pub max_active_streams: usize,
 }
 
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    30
+}
+fn default_idle_timeout() -> u64 {
+    60
+}
 fn default_buffer_kb() -> usize {
     512
 }
@@ -106,6 +128,9 @@ fn default_max_streams() -> usize {
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
+            connect_timeout_secs: default_connect_timeout(),
+            request_timeout_secs: default_request_timeout(),
+            idle_timeout_secs: default_idle_timeout(),
             buffer_kb: default_buffer_kb(),
             circuit_breaker_threshold: default_cb_threshold(),
             circuit_breaker_cooldown_secs: default_cb_cooldown(),

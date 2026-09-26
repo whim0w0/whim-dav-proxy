@@ -241,8 +241,7 @@ impl WebDavHandler {
             if let Ok(dest_str) = dest.to_str() {
                 if let Some(dest_path) = self.destination_path(dest_str) {
                     let real_dest: String = self.encrypt_path(&dest_path);
-                    let upstream_dest: String =
-                        ProxyEngine::upstream_url(&self.cfg, &real_dest);
+                    let upstream_dest: String = ProxyEngine::upstream_url(&self.cfg, &real_dest);
                     if let Ok(val) = HeaderValue::from_str(&upstream_dest) {
                         new_headers.insert("Destination", val);
                     }
@@ -270,8 +269,7 @@ impl WebDavHandler {
             if let Some(dest) = headers.get("Destination") {
                 if let Ok(dest_str) = dest.to_str() {
                     if let Some(dest_path) = self.destination_path(dest_str) {
-                        let plain_dest: String =
-                            ProxyEngine::upstream_url(&self.cfg, &dest_path);
+                        let plain_dest: String = ProxyEngine::upstream_url(&self.cfg, &dest_path);
                         if let Ok(val) = HeaderValue::from_str(&plain_dest) {
                             plain_headers.insert("Destination", val);
                         }
@@ -316,17 +314,37 @@ impl WebDavHandler {
             .as_ref()
             .map_or(false, |e: &EncryptionConfig| e.enable && e.enc_name);
 
-        let target_url: String = ProxyEngine::upstream_url(&self.cfg, dav_path);
-
         let method: Method = Method::from_bytes(b"PROPFIND").unwrap_or(Method::GET);
-        let (status, mut resp_headers, resp_bytes) = self
-            .engine
-            .proxy_request(method, &target_url, headers, body)
-            .await?;
+
+        // 目录名在上游保持明文，只有文件名被加密；而 PROPFIND 的目标既可能是文件也可能是
+        // 目录，且客户端的目录路径不保证带尾斜杠。因此先按加密路径请求，若上游返回 404
+        // 再回退到明文路径（与 DELETE / MOVE 的处理方式一致，避免目录被误加密而 404）。
+        let (status, mut resp_headers, resp_bytes) = if has_enc_name {
+            let real_path: String = self.encrypt_path(dav_path);
+            let target_url: String = ProxyEngine::upstream_url(&self.cfg, &real_path);
+            let first: (StatusCode, HeaderMap, Bytes) = self
+                .engine
+                .proxy_request(method.clone(), &target_url, headers, body.clone())
+                .await?;
+
+            if is_missing_resource(first.0) && real_path != dav_path {
+                let plain_url: String = ProxyEngine::upstream_url(&self.cfg, dav_path);
+                self.engine
+                    .proxy_request(method, &plain_url, headers, body)
+                    .await?
+            } else {
+                first
+            }
+        } else {
+            let target_url: String = ProxyEngine::upstream_url(&self.cfg, dav_path);
+            self.engine
+                .proxy_request(method, &target_url, headers, body)
+                .await?
+        };
 
         let mut resp_body: Vec<u8> = resp_bytes.to_vec();
 
-        if has_enc_name && status == StatusCode::from_u16(207).unwrap_or(StatusCode::OK) {
+        if has_enc_name && status == StatusCode::MULTI_STATUS {
             if let Some(enc) = self.cfg.encryption.as_ref() {
                 resp_body = self.decrypt_propfind_xml(&resp_body, enc);
             }
@@ -339,6 +357,12 @@ impl WebDavHandler {
         Ok((status, resp_headers, Body::from(resp_body)))
     }
 
+    /// 解密 PROPFIND 响应中承载上游密文文件名的字段，避免客户端看到 `xxx.enc` 乱码。
+    ///
+    /// - `<D:href>`：绝对路径，其目录部分在上游保持明文；
+    /// - `<D:displayname>`：裸文件名，客户端据此显示条目名称。
+    ///
+    /// 目录名与本来就未加密的名称会原样返回（见 [`FileNameConverter::decrypt_path`]）。
     fn decrypt_propfind_xml(&self, body: &[u8], enc: &EncryptionConfig) -> Vec<u8> {
         let text: &str = match std::str::from_utf8(body) {
             Ok(s) => s,
@@ -348,31 +372,14 @@ impl WebDavHandler {
         let converter: FileNameConverter =
             FileNameConverter::new(&enc.password, &enc.enc_type, enc.enc_suffix.as_deref());
 
-        let mut result: String = String::with_capacity(text.len());
-        let mut remaining: &str = text;
-
-        while !remaining.is_empty() {
-            if let Some(href_start) = remaining.find("<D:href>") {
-                result.push_str(&remaining[..href_start + 8]);
-                remaining = &remaining[href_start + 8..];
-
-                if let Some(href_end) = remaining.find("</D:href>") {
-                    let href: &str = &remaining[..href_end];
-                    let decrypted: String = converter.decrypt_path(href);
-                    result.push_str(&decrypted);
-                    result.push_str("</D:href>");
-                    remaining = &remaining[href_end + 9..];
-                } else {
-                    result.push_str(remaining);
-                    remaining = "";
-                }
-            } else {
-                result.push_str(remaining);
-                remaining = "";
-            }
-        }
-
-        result.into_bytes()
+        let mut out: String = text.to_string();
+        out = decrypt_tag(&out, "D:href", |v: &str| converter.decrypt_path(v));
+        // displayname 是裸文件名，解密结果不应带前导斜杠；解不出来就保留原值。
+        out = decrypt_tag(&out, "D:displayname", |v: &str| {
+            let name: String = converter.decrypt_name(v);
+            if name.is_empty() { v.to_string() } else { name }
+        });
+        out.into_bytes()
     }
 
     fn strip_propfind_hrefs(&self, body: &[u8]) -> Vec<u8> {
@@ -404,6 +411,34 @@ fn is_missing_resource(status: StatusCode) -> bool {
         status,
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::GONE
     )
+}
+
+/// 将 `text` 中所有 `<tag>…</tag>` 的内容替换为 `f(内容)`，其余部分原样保留。
+///
+/// 采用字符串扫描而非完整 XML 解析：multistatus 响应结构简单，而上游可能包含本代理
+/// 不认识的命名空间与扩展属性，重新序列化整份 XML 反而更容易破坏响应。
+fn decrypt_tag(text: &str, tag: &str, f: impl Fn(&str) -> String) -> String {
+    let open: String = format!("<{}>", tag);
+    let close: String = format!("</{}>", tag);
+
+    let mut result: String = String::with_capacity(text.len());
+    let mut remaining: &str = text;
+
+    while let Some(start) = remaining.find(&open) {
+        result.push_str(&remaining[..start + open.len()]);
+        remaining = &remaining[start + open.len()..];
+
+        let Some(end) = remaining.find(&close) else {
+            result.push_str(remaining);
+            return result;
+        };
+        result.push_str(&f(&remaining[..end]));
+        result.push_str(&close);
+        remaining = &remaining[end + close.len()..];
+    }
+
+    result.push_str(remaining);
+    result
 }
 
 async fn collect_body(body: axum::body::Body) -> Result<Bytes, ProxyError> {

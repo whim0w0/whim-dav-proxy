@@ -185,7 +185,10 @@ impl FileNameConverter {
             .file_name()
             .and_then(|n: &std::ffi::OsStr| n.to_str())
             .unwrap_or(display_path);
-        let dir: &str = path.parent().and_then(|p: &std::path::Path| p.to_str()).unwrap_or("");
+        let dir: &str = path
+            .parent()
+            .and_then(|p: &std::path::Path| p.to_str())
+            .unwrap_or("");
 
         let ext: &str = std::path::Path::new(file_name)
             .extension()
@@ -222,38 +225,12 @@ impl FileNameConverter {
             .file_name()
             .and_then(|n: &std::ffi::OsStr| n.to_str())
             .unwrap_or(encrypted_path);
-        let dir: &str = path.parent().and_then(|p: &std::path::Path| p.to_str()).unwrap_or("");
+        let dir: &str = path
+            .parent()
+            .and_then(|p: &std::path::Path| p.to_str())
+            .unwrap_or("");
 
-        let enc_name: String = match &self.enc_suffix {
-            Some(sfx) => {
-                let dot: String = format!(".{}", sfx);
-                let dotdot: String = format!("..{}", sfx);
-                if let Some(b) = file_name.strip_suffix(&dotdot) {
-                    b.to_string()
-                } else if let Some(b) = file_name.strip_suffix(&dot) {
-                    b.to_string()
-                } else {
-                    return encrypted_path.to_string();
-                }
-            }
-            None => {
-                let ext: &str = std::path::Path::new(file_name)
-                    .extension()
-                    .and_then(|e: &std::ffi::OsStr| e.to_str())
-                    .unwrap_or("");
-                if ext.is_empty() {
-                    file_name.to_string()
-                } else {
-                    let with_dot: String = format!(".{}", ext);
-                    file_name
-                        .strip_suffix(&with_dot)
-                        .unwrap_or(file_name)
-                        .to_string()
-                }
-            }
-        };
-
-        let show_name: String = decode_name(&self.password, &self.enc_type, &enc_name);
+        let show_name: String = self.decrypt_name(file_name);
 
         if show_name.is_empty() {
             return encrypted_path.to_string();
@@ -265,6 +242,43 @@ impl FileNameConverter {
         } else {
             format!("{}/{}", dir_trim, show_name)
         }
+    }
+
+    /// 解密单个文件名（不含目录部分，返回值也不带前导斜杠）。
+    ///
+    /// 非密文（如上游的目录名、本就未加密的名称）或解密失败时返回空字符串，
+    /// 由调用方决定是否保留原值。主要用于 WebDAV 的 `displayname`。
+    pub fn decrypt_name(&self, encrypted_name: &str) -> String {
+        let enc_name: String = match &self.enc_suffix {
+            Some(sfx) => {
+                let dot: String = format!(".{}", sfx);
+                let dotdot: String = format!("..{}", sfx);
+                if let Some(b) = encrypted_name.strip_suffix(&dotdot) {
+                    b.to_string()
+                } else if let Some(b) = encrypted_name.strip_suffix(&dot) {
+                    b.to_string()
+                } else {
+                    return String::new();
+                }
+            }
+            None => {
+                let ext: &str = std::path::Path::new(encrypted_name)
+                    .extension()
+                    .and_then(|e: &std::ffi::OsStr| e.to_str())
+                    .unwrap_or("");
+                if ext.is_empty() {
+                    encrypted_name.to_string()
+                } else {
+                    let with_dot: String = format!(".{}", ext);
+                    encrypted_name
+                        .strip_suffix(&with_dot)
+                        .unwrap_or(encrypted_name)
+                        .to_string()
+                }
+            }
+        };
+
+        decode_name(&self.password, &self.enc_type, &enc_name)
     }
 }
 

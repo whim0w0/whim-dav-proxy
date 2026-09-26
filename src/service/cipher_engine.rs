@@ -1,9 +1,50 @@
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 use crate::crypto::{BlockCipher, CYPTO_META_SIZE, CryptoMeta, EncType, StreamCipher};
-use crate::errors::ProxyError;
+use crate::errors::{ProxyError, reqwest_error};
+
+/// 以上游响应体为源，包装出带「空闲超时」保护的字节流。
+///
+/// 每成功收到一块数据就重新计时，因此**不会**限制大文件的总传输时长；
+/// 但若上游长时间（`idle`）不再发送任何数据，则发出一个错误项而不是永久挂起。
+pub(super) fn guard_idle(
+    response: reqwest::Response,
+    idle: Option<Duration>,
+) -> Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send>> {
+    Box::pin(futures_util::stream::unfold(
+        Some((response.bytes_stream(), idle)),
+        |state| async move {
+            let (mut s, idle) = state?;
+            match idle {
+                None => {
+                    let item = s.next().await?;
+                    Some((
+                        item.map_err(|e: reqwest::Error| reqwest_error("stream read", e)),
+                        Some((s, idle)),
+                    ))
+                }
+                Some(d) => match tokio::time::timeout(d, s.next()).await {
+                    Ok(Some(item)) => Some((
+                        item.map_err(|e: reqwest::Error| reqwest_error("stream read", e)),
+                        Some((s, idle)),
+                    )),
+                    Ok(None) => None,
+                    Err(_) => Some((
+                        Err(ProxyError::proxy(format!(
+                            "upstream idle timeout: no data received for {}s",
+                            d.as_secs()
+                        ))),
+                        None,
+                    )),
+                },
+            }
+        },
+    ))
+}
 
 pub(super) enum CipherBox {
     Block(Box<dyn BlockCipher>),
@@ -166,7 +207,7 @@ pub(super) struct BlockEngine;
 impl BlockEngine {
     fn spawn_block_decrypt(
         &self,
-        response: reqwest::Response,
+        stream: impl futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
         mut cipher: Box<dyn BlockCipher>,
         skip_cipher_prefix: usize,
         skip_plain_prefix: usize,
@@ -175,7 +216,7 @@ impl BlockEngine {
     ) {
         let frame: usize = cipher.frame_size();
         tokio::spawn(async move {
-            let mut stream = response.bytes_stream();
+            let mut stream = Box::pin(stream);
             let mut cipher_prefix: usize = skip_cipher_prefix;
             let mut buf: Vec<u8> = Vec::new();
             let mut skipped: u64 = 0;
@@ -186,7 +227,7 @@ impl BlockEngine {
                 let data: Bytes = match chunk {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = tx.send(Err(ProxyError::proxy(format!("stream read: {}", e))));
+                        let _ = tx.send(Err(e));
                         return;
                     }
                 };
@@ -230,13 +271,13 @@ impl BlockEngine {
         body_stream: S,
         mut cipher: Box<dyn BlockCipher>,
         meta_header: Bytes,
-        body_tx: UnboundedSender<Result<Bytes, ProxyError>>,
+        body_tx: Sender<Result<Bytes, ProxyError>>,
     ) where
         S: futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
     {
         let block: usize = cipher.plain_block_size();
         tokio::spawn(async move {
-            if body_tx.send(Ok(meta_header)).is_err() {
+            if body_tx.send(Ok(meta_header)).await.is_err() {
                 return;
             }
             let mut plain_buf: Vec<u8> = Vec::with_capacity(block);
@@ -250,13 +291,13 @@ impl BlockEngine {
                         while plain_buf.len() >= block {
                             let enc: Vec<u8> = cipher.encrypt(&plain_buf[..block]);
                             plain_buf.drain(..block);
-                            if body_tx.send(Ok(Bytes::from(enc))).is_err() {
+                            if body_tx.send(Ok(Bytes::from(enc))).await.is_err() {
                                 return;
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = body_tx.send(Err(e));
+                        let _ = body_tx.send(Err(e)).await;
                         return;
                     }
                 }
@@ -264,7 +305,7 @@ impl BlockEngine {
 
             if !plain_buf.is_empty() {
                 let enc: Vec<u8> = cipher.encrypt(&plain_buf);
-                let _ = body_tx.send(Ok(Bytes::from(enc)));
+                let _ = body_tx.send(Ok(Bytes::from(enc))).await;
             }
         });
     }
@@ -275,7 +316,7 @@ pub(super) struct StreamEngine;
 impl StreamEngine {
     fn spawn_stream_decrypt(
         &self,
-        response: reqwest::Response,
+        stream: impl futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
         mut cipher: Box<dyn StreamCipher>,
         skip_cipher_prefix: usize,
         skip_plain_prefix: usize,
@@ -283,7 +324,7 @@ impl StreamEngine {
         tx: UnboundedSender<Result<Bytes, ProxyError>>,
     ) {
         tokio::spawn(async move {
-            let mut stream = response.bytes_stream();
+            let mut stream = Box::pin(stream);
             let mut cipher_prefix: usize = skip_cipher_prefix;
             let mut skipped: u64 = 0;
 
@@ -293,7 +334,7 @@ impl StreamEngine {
                 let data: Bytes = match chunk {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = tx.send(Err(ProxyError::proxy(format!("stream read: {}", e))));
+                        let _ = tx.send(Err(e));
                         return;
                     }
                 };
@@ -312,7 +353,7 @@ impl StreamEngine {
 
     fn spawn_stream_range_decrypt(
         &self,
-        response: reqwest::Response,
+        stream: impl futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
         mut cipher: Box<dyn StreamCipher>,
         start_plain: u64,
         skip_plain_prefix: usize,
@@ -326,7 +367,7 @@ impl StreamEngine {
             cipher.decrypt(&vec![0u8; n]);
             remaining -= n as u64;
         }
-        self.spawn_stream_decrypt(response, cipher, 0, skip_plain_prefix, want, tx)
+        self.spawn_stream_decrypt(stream, cipher, 0, skip_plain_prefix, want, tx)
     }
 
     fn spawn_stream_encrypt<S>(
@@ -334,12 +375,12 @@ impl StreamEngine {
         body_stream: S,
         mut cipher: Box<dyn StreamCipher>,
         meta_header: Bytes,
-        body_tx: UnboundedSender<Result<Bytes, ProxyError>>,
+        body_tx: Sender<Result<Bytes, ProxyError>>,
     ) where
         S: futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
     {
         tokio::spawn(async move {
-            if body_tx.send(Ok(meta_header)).is_err() {
+            if body_tx.send(Ok(meta_header)).await.is_err() {
                 return;
             }
             let mut stream = Box::pin(body_stream);
@@ -348,12 +389,12 @@ impl StreamEngine {
                 match chunk {
                     Ok(data) => {
                         let enc: Vec<u8> = cipher.encrypt(&data);
-                        if body_tx.send(Ok(Bytes::from(enc))).is_err() {
+                        if body_tx.send(Ok(Bytes::from(enc))).await.is_err() {
                             return;
                         }
                     }
                     Err(e) => {
-                        let _ = body_tx.send(Err(e));
+                        let _ = body_tx.send(Err(e)).await;
                         return;
                     }
                 }
@@ -382,6 +423,7 @@ impl CipherEngine {
         skip_cipher_prefix: usize,
         skip_plain_prefix: usize,
         want: Option<u64>,
+        idle: Option<Duration>,
         tx: UnboundedSender<Result<Bytes, ProxyError>>,
     ) {
         debug_assert!(
@@ -392,12 +434,13 @@ impl CipherEngine {
             ),
             "CipherEngine 与 CipherBox 算法族不一致"
         );
+        let stream = guard_idle(response, idle);
         match (self, cipher) {
             (CipherEngine::Block(e), CipherBox::Block(c)) => {
-                e.spawn_block_decrypt(response, c, skip_cipher_prefix, skip_plain_prefix, want, tx)
+                e.spawn_block_decrypt(stream, c, skip_cipher_prefix, skip_plain_prefix, want, tx)
             }
             (CipherEngine::Stream(e), CipherBox::Stream(c)) => {
-                e.spawn_stream_decrypt(response, c, skip_cipher_prefix, skip_plain_prefix, want, tx)
+                e.spawn_stream_decrypt(stream, c, skip_cipher_prefix, skip_plain_prefix, want, tx)
             }
             (CipherEngine::Block(_), CipherBox::Stream(_))
             | (CipherEngine::Stream(_), CipherBox::Block(_)) => {
@@ -413,6 +456,7 @@ impl CipherEngine {
         start_plain: u64,
         skip_plain_prefix: usize,
         want: Option<u64>,
+        idle: Option<Duration>,
         tx: UnboundedSender<Result<Bytes, ProxyError>>,
     ) {
         debug_assert!(
@@ -423,12 +467,13 @@ impl CipherEngine {
             ),
             "CipherEngine 与 CipherBox 算法族不一致"
         );
+        let stream = guard_idle(response, idle);
         match (self, cipher) {
             (CipherEngine::Block(e), CipherBox::Block(c)) => {
-                e.spawn_block_decrypt(response, c, 0, skip_plain_prefix, want, tx)
+                e.spawn_block_decrypt(stream, c, 0, skip_plain_prefix, want, tx)
             }
             (CipherEngine::Stream(e), CipherBox::Stream(c)) => {
-                e.spawn_stream_range_decrypt(response, c, start_plain, skip_plain_prefix, want, tx)
+                e.spawn_stream_range_decrypt(stream, c, start_plain, skip_plain_prefix, want, tx)
             }
 
             (CipherEngine::Block(_), CipherBox::Stream(_))
@@ -443,7 +488,7 @@ impl CipherEngine {
         body_stream: S,
         cipher: CipherBox,
         meta_header: Bytes,
-        body_tx: UnboundedSender<Result<Bytes, ProxyError>>,
+        body_tx: Sender<Result<Bytes, ProxyError>>,
     ) where
         S: futures_util::Stream<Item = Result<Bytes, ProxyError>> + Send + 'static,
     {
